@@ -6,7 +6,22 @@ Provides first-class primitives for:
 - Signals: external events delivered to a run with deterministic matching
 - Timers: time-based wake-ups (synthetic timeout signals)
 
-Guarantees: run isolation, exactly-once resume per wait, deterministic (FIFO) matching.
+Lifecycle: a node calls wait() and gets ExecutionPaused; the runner persists that
+and stops. Later, signal() (external event) or tick() (timeout) matches one pending
+wait; the runner resumes that run with the wait result (signal payload or timeout).
+
+Guarantees:
+- Run isolation: waits and signals are scoped per run_id.
+- Exactly-once resume: each wait is resumed at most once (FIFO matching; "atomic
+  claim" means the store marks the wait resumed when it is chosen).
+- Deterministic matching: exact-match key/value selectors only; no arbitrary predicates.
+- Signal idempotency: duplicate delivery of the same signal_id does not double-resume
+  (store deduplicates by signal_id).
+
+Durable data invariants (for replay and schema evolution):
+- Immutability: durable fields are deep-immutable (primitives, tuples, frozen mappings).
+- Versioning: every persisted object has schema_version for upgrade-on-read when
+  loading old payloads.
 """
 
 from __future__ import annotations
@@ -16,15 +31,50 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from framework.runtime.event_bus import EventBus
 
 logger = logging.getLogger(__name__)
 
-# Synthetic signal type emitted when a wait times out (node logic can branch uniformly)
+# Synthetic signal type emitted when a wait times out. Timeout is surfaced as a signal
+# so node logic can branch on matched_signal_type only (e.g. "email.reply" vs this),
 WAIT_TIMEOUT_SIGNAL_TYPE = "wait.timeout"
+
+# --- Durable value types (deep immutability for replay and schema evolution) ---
+
+Primitive = str | int | float | bool
+"""Only primitive values allowed in durable selectors/payloads; no nested mutables."""
+
+ImmutableSelectors = tuple[tuple[str, Primitive], ...]
+"""
+Exact-match key/value selectors for deterministic, indexable matching.
+Canonical representation: tuple of (key, value) pairs. Use selectors_from_dict()
+to build from a dict; use selectors_to_dict() to read back.
+"""
+
+
+def selectors_from_dict(d: dict[str, Primitive] | None) -> ImmutableSelectors | None:
+    """
+    Build immutable selectors from a dict. None -> None; {} -> ().
+    Sorted by key for deterministic order and equality.
+    """
+    if d is None:
+        return None
+    if not d:
+        return ()
+    return tuple(sorted(d.items()))
+
+
+def selectors_to_dict(s: ImmutableSelectors | None) -> dict[str, Primitive]:
+    """Convert immutable selectors back to a dict for matching/reading."""
+    if s is None or len(s) == 0:
+        return {}
+    return dict(s)
+
+
+# --- Versioned, immutable durable contracts ---
 
 
 @dataclass(frozen=True)
@@ -34,6 +84,9 @@ class WaitRequest:
 
     Unique within a run. When persisted, execution suspends until a matching
     signal is delivered or timeout_at is reached.
+
+    Durable invariants: schema_version for upgrade-on-read; match is
+    immutable and deterministic (exact-match selectors only).
     """
 
     wait_id: str
@@ -41,8 +94,10 @@ class WaitRequest:
     node_id: str
     attempt: int
     signal_type: str  # e.g. "email.reply", "approval"
-    match: dict[str, Any] | None  # optional structured filter
+    match: ImmutableSelectors | None  # optional exact-match selectors
     timeout_at: datetime | None
+    schema_version: int = 1
+    type: str = "wait_request"
 
 
 @dataclass(frozen=True)
@@ -51,14 +106,22 @@ class SignalEnvelope:
     Externally delivered event.
 
     Delivered at least once; runtime guarantees exactly-once resume per wait,
-    not exactly-once delivery.
+    not exactly-once delivery. signal_id is required for idempotency: duplicate
+    delivery of the same signal_id does not cause duplicate resume.
     """
 
     signal_type: str
-    payload: dict[str, Any]
+    payload: ImmutableSelectors  # immutable key-value pairs for replay safety
+    signal_id: str  # stable id for deduplication; store enforces uniqueness
     correlation_id: str | None
     causation_id: str | None
     received_at: datetime
+    schema_version: int = 1
+    type: str = "signal_envelope"
+
+    def payload_as_dict(self) -> dict[str, Primitive]:
+        """Return payload as dict for node consumption (e.g. _resume_signal_payload)."""
+        return selectors_to_dict(self.payload)
 
 
 @dataclass
@@ -93,110 +156,148 @@ class WaitResumed:
     matched_signal_type: str | None = None  # set when resumed by signal
 
 
+def _match_filter(
+    wait_match: ImmutableSelectors | None,
+    payload: ImmutableSelectors,
+) -> bool:
+    """True if payload satisfies wait_match (all keys in wait_match equal in payload)."""
+    if wait_match is None or len(wait_match) == 0:
+        return True
+    payload_dict = selectors_to_dict(payload)
+    for k, v in wait_match:
+        if payload_dict.get(k) != v:
+            return False
+    return True
+
+
 class WaitStoreIfce(ABC):
     """
     Interface for persisting and querying pending waits.
 
     Implementations must guarantee run isolation and exactly-once
-    resume per (run_id, wait_id).
+    resume per (run_id, wait_id). Waits have explicit lifecycle state
+    (active -> resumed); match_signal and mark_resumed perform atomic claim.
+    Duplicate delivery of the same signal_id must not cause duplicate resume.
     """
 
     @abstractmethod
     async def add(self, wait: WaitRequest) -> None:
-        """Persist a wait. Idempotent for same wait_id within run."""
+        """Persist a wait in active state. Idempotent for same wait_id within run."""
         ...
 
     @abstractmethod
     async def get_pending(self, run_id: str) -> list[WaitRequest]:
-        """Return pending waits for the run, in creation order (FIFO)."""
+        """Return pending (active) waits for the run, in creation order (FIFO)."""
         ...
 
     @abstractmethod
     async def match_signal(self, run_id: str, envelope: SignalEnvelope) -> str | None:
         """
-        Find one pending wait matching the signal (type + optional match filter).
+        Find one active wait matching the signal (type + optional match filter).
 
-        Deterministic: FIFO by creation order. Removes the matched wait
-        (exactly-once resume). Returns wait_id or None.
+        Deterministic: FIFO by creation order. Atomically claims the wait
+        (exactly-once resume). If envelope.signal_id was already applied for
+        this run, returns None (idempotency). Returns wait_id or None.
         """
         ...
 
     @abstractmethod
     async def mark_resumed(self, run_id: str, wait_id: str) -> None:
-        """Mark a wait as resumed (e.g. after timeout). Removes from pending."""
+        """Mark an active wait as resumed (e.g. after timeout). Atomic claim."""
         ...
 
     @abstractmethod
     async def get_expired(self, now: datetime) -> list[tuple[str, str]]:
-        """Return (run_id, wait_id) pairs for waits with timeout_at <= now."""
+        """
+        Return (run_id, wait_id) pairs for active waits with timeout_at <= now.
+
+        Implementations may either only enumerate expired waits (caller calls
+        mark_resumed) or enumerate and mark them resumed; see implementation.
+        """
         ...
 
 
-def _match_filter(wait_match: dict[str, Any] | None, payload: dict[str, Any]) -> bool:
-    """True if payload satisfies wait_match (all keys in wait_match equal in payload)."""
-    if wait_match is None:
-        return True
-    for k, v in wait_match.items():
-        if payload.get(k) != v:
-            return False
-    return True
+WaitStatus = Literal["active", "resumed"]
+
+
+@dataclass
+class _StoredWait:
+    """Internal: wait plus explicit lifecycle state for exactly-once resume."""
+
+    wait: WaitRequest
+    status: WaitStatus
 
 
 class InMemoryWaitStore(WaitStoreIfce):
     """
     In-memory wait store: pending waits per run, FIFO order.
 
-    Run-isolated; exactly-once resume via removal on match/mark_resumed.
+    Run-isolated; exactly-once resume via explicit status (active -> resumed).
+    Deduplicates by signal_id so duplicate delivery does not double-resume.
     """
 
     def __init__(self) -> None:
-        # run_id -> list of WaitRequest (append-only, match removes)
-        self._pending: dict[str, list[WaitRequest]] = {}
+        # run_id -> list of _StoredWait (creation order; status active or resumed)
+        self._pending: dict[str, list[_StoredWait]] = {}
+        # run_id -> set of signal_id already applied (idempotency)
+        self._processed_signal_ids: dict[str, set[str]] = {}
         self._lock = asyncio.Lock()
 
     async def add(self, wait: WaitRequest) -> None:
         async with self._lock:
             if wait.run_id not in self._pending:
                 self._pending[wait.run_id] = []
-            # Avoid duplicate wait_id
-            existing_ids = {w.wait_id for w in self._pending[wait.run_id]}
+            existing_ids = {
+                s.wait.wait_id for s in self._pending[wait.run_id] if s.status == "active"
+            }
             if wait.wait_id not in existing_ids:
-                self._pending[wait.run_id].append(wait)
+                self._pending[wait.run_id].append(_StoredWait(wait=wait, status="active"))
 
     async def get_pending(self, run_id: str) -> list[WaitRequest]:
         async with self._lock:
-            return list(self._pending.get(run_id, []))
+            return [s.wait for s in self._pending.get(run_id, []) if s.status == "active"]
 
     async def match_signal(self, run_id: str, envelope: SignalEnvelope) -> str | None:
         async with self._lock:
+            # Idempotency: same signal_id applied twice -> no second resume
+            processed = self._processed_signal_ids.setdefault(run_id, set())
+            if envelope.signal_id in processed:
+                return None
             pending = self._pending.get(run_id, [])
-            for i, w in enumerate(pending):
+            for i, s in enumerate(pending):
+                if s.status != "active":
+                    continue
+                w = s.wait
                 if w.signal_type != envelope.signal_type:
                     continue
                 if not _match_filter(w.match, envelope.payload):
                     continue
-                # Match: remove and return
-                wait_id = w.wait_id
-                self._pending[run_id] = pending[:i] + pending[i + 1 :]
-                return wait_id
+                # Atomic claim: mark resumed and record signal_id
+                pending[i] = _StoredWait(wait=w, status="resumed")
+                processed.add(envelope.signal_id)
+                return w.wait_id
         return None
 
     async def mark_resumed(self, run_id: str, wait_id: str) -> None:
         async with self._lock:
             pending = self._pending.get(run_id, [])
-            self._pending[run_id] = [w for w in pending if w.wait_id != wait_id]
+            for i, s in enumerate(pending):
+                if s.status == "active" and s.wait.wait_id == wait_id:
+                    pending[i] = _StoredWait(wait=s.wait, status="resumed")
+                    break
 
     async def get_expired(self, now: datetime) -> list[tuple[str, str]]:
         async with self._lock:
             result: list[tuple[str, str]] = []
             for rid, pending in list(self._pending.items()):
-                remaining: list[WaitRequest] = []
-                for w in pending:
+                for i, s in enumerate(pending):
+                    if s.status != "active":
+                        continue
+                    w = s.wait
                     if w.timeout_at is not None and w.timeout_at <= now:
+                        # Mark resumed here so we only hand out each wait once
+                        pending[i] = _StoredWait(wait=w, status="resumed")
                         result.append((rid, w.wait_id))
-                    else:
-                        remaining.append(w)
-                self._pending[rid] = remaining
             return result
 
 

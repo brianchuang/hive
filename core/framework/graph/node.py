@@ -458,6 +458,10 @@ class NodeContext:
     attempt: int = 1
     max_attempts: int = 3
 
+    # Durable wait: run identifier and runtime for wait/signal (optional)
+    run_id: str | None = None
+    durable_wait_runtime: Any = None
+
 
 @dataclass
 class NodeResult:
@@ -482,6 +486,9 @@ class NodeResult:
     # Metadata
     tokens_used: int = 0
     latency_ms: int = 0
+
+    # Durable wait: when set, execution suspended on wait; caller should persist and resume later
+    paused: Any = None  # ExecutionPaused from durable_wait runtime
 
     # Pydantic validation errors (if any)
     validation_errors: list[str] = field(default_factory=list)

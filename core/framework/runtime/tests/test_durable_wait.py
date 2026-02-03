@@ -8,6 +8,10 @@ Required surface area (issue):
 - Semantics: run isolation, exactly-once resume, deterministic FIFO, timers as synthetic signals
 - Lifecycle events: WAIT_CREATED, WAIT_MATCHED, WAIT_TIMED_OUT, WAIT_RESUMED
 - Opt-in: runtime works without event_bus
+
+Follow-up TDD (durable invariants): Section "Follow-up TDD: durable invariants" encodes the five
+industry-standard constraints so regressions fail fast: deep immutability, versioning, deterministic
+matching, explicit wait lifecycle, signal idempotency.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from framework.runtime.durable_wait import (
     WaitRequest,
     WaitResumed,
     WaitStoreIfce,
+    selectors_from_dict,
 )
 from framework.runtime.event_bus import AgentEvent, EventBus, EventType
 
@@ -47,7 +52,7 @@ def wait_request(run_id: str) -> WaitRequest:
         node_id="node_a",
         attempt=1,
         signal_type="email.reply",
-        match={"thread_id": "t1"},
+        match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=datetime(2025, 3, 1, 12, 0, 0, tzinfo=UTC),
     )
 
@@ -56,7 +61,8 @@ def wait_request(run_id: str) -> WaitRequest:
 def signal_envelope() -> SignalEnvelope:
     return SignalEnvelope(
         signal_type="email.reply",
-        payload={"thread_id": "t1", "body": "Got it"},
+        payload=selectors_from_dict({"thread_id": "t1", "body": "Got it"}) or (),
+        signal_id="sig_001",
         correlation_id="c1",
         causation_id=None,
         received_at=datetime.now(UTC),
@@ -87,8 +93,10 @@ def test_wait_request_creation(wait_request: WaitRequest, run_id: str) -> None:
     assert wait_request.node_id == "node_a"
     assert wait_request.attempt == 1
     assert wait_request.signal_type == "email.reply"
-    assert wait_request.match == {"thread_id": "t1"}
+    assert wait_request.match == (("thread_id", "t1"),)
     assert wait_request.timeout_at is not None
+    assert wait_request.schema_version == 1
+    assert wait_request.type == "wait_request"
 
 
 def test_wait_request_frozen(wait_request: WaitRequest) -> None:
@@ -98,8 +106,11 @@ def test_wait_request_frozen(wait_request: WaitRequest) -> None:
 
 def test_signal_envelope_creation(signal_envelope: SignalEnvelope) -> None:
     assert signal_envelope.signal_type == "email.reply"
-    assert signal_envelope.payload["thread_id"] == "t1"
+    assert signal_envelope.payload_as_dict()["thread_id"] == "t1"
     assert signal_envelope.correlation_id == "c1"
+    assert signal_envelope.signal_id == "sig_001"
+    assert signal_envelope.schema_version == 1
+    assert signal_envelope.type == "signal_envelope"
 
 
 def test_signal_envelope_frozen(signal_envelope: SignalEnvelope) -> None:
@@ -122,6 +133,167 @@ def test_execution_paused_creation(wait_request: WaitRequest) -> None:
     assert paused.run_id == wait_request.run_id
     assert paused.session_state == session_state
     assert paused.wait_request == wait_request
+
+
+# === Follow-up TDD: durable invariants (industry-standard constraints) ===
+# These tests encode the five required invariants so regressions fail fast.
+# See follow-up: "Durable Data Modeling, Versioning, and Exactly-Once Semantics."
+
+
+def test_immutability_match_is_deep_immutable_canonical() -> None:
+    """Deep immutability: match is tuple of (key, value); no nested mutables; canonical order."""
+    match = selectors_from_dict({"b": 1, "a": "x"})
+    assert match == (("a", "x"), ("b", 1))  # sorted by key
+    # Same dict -> same tuple (deterministic equality)
+    assert selectors_from_dict({"a": "x", "b": 1}) == match
+    # Type is tuple of tuples (hashable, no mutation possible)
+    assert isinstance(match, tuple)
+    assert all(isinstance(pair, tuple) and len(pair) == 2 for pair in match)
+
+
+def test_immutability_payload_is_deep_immutable() -> None:
+    """Deep immutability: SignalEnvelope.payload is ImmutableSelectors (replay-safe)."""
+    payload = selectors_from_dict({"k": "v"}) or ()
+    env = SignalEnvelope(
+        signal_type="x",
+        payload=payload,
+        signal_id="id1",
+        correlation_id=None,
+        causation_id=None,
+        received_at=datetime.now(UTC),
+    )
+    assert env.payload == (("k", "v"),)
+    assert env.payload_as_dict() == {"k": "v"}
+    # Payload is tuple; no mutation
+    assert isinstance(env.payload, tuple)
+
+
+def test_versioning_wait_request_has_schema_version_and_type() -> None:
+    """Versioning: every durable object has schema_version and type for upgrade-on-read."""
+    req = WaitRequest(
+        wait_id="w",
+        run_id="r",
+        node_id="n",
+        attempt=1,
+        signal_type="x",
+        match=None,
+        timeout_at=None,
+    )
+    assert req.schema_version == 1
+    assert req.type == "wait_request"
+
+
+def test_versioning_signal_envelope_has_schema_version_and_type() -> None:
+    """Versioning: SignalEnvelope has schema_version and type (stable discriminator)."""
+    env = SignalEnvelope(
+        signal_type="x",
+        payload=(),
+        signal_id="sid",
+        correlation_id=None,
+        causation_id=None,
+        received_at=datetime.now(UTC),
+    )
+    assert env.schema_version == 1
+    assert env.type == "signal_envelope"
+
+
+@pytest.mark.asyncio
+async def test_deterministic_matching_exact_key_value_only() -> None:
+    """Deterministic matching: signal_type + exact key/value only; no arbitrary predicates."""
+    match = selectors_from_dict({"thread_id": "t1"})
+    req = WaitRequest(
+        wait_id="w1",
+        run_id="run_1",
+        node_id="n",
+        attempt=1,
+        signal_type="email.reply",
+        match=match,
+        timeout_at=None,
+    )
+    store = InMemoryWaitStore()
+    run_id = "run_1"
+    await store.add(req)
+    env = SignalEnvelope(
+        signal_type="email.reply",
+        payload=selectors_from_dict({"thread_id": "t1", "extra": "ignored"}) or (),
+        signal_id="sig_1",
+        correlation_id=None,
+        causation_id=None,
+        received_at=datetime.now(UTC),
+    )
+    result = await store.match_signal(run_id, env)
+    assert result == "w1"
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_get_pending_returns_only_active_waits(
+    wait_store: WaitStoreIfce,
+    wait_request: WaitRequest,
+    signal_envelope: SignalEnvelope,
+    run_id: str,
+) -> None:
+    """Exactly-once resume: get_pending returns only active waits; resumed are excluded."""
+    await wait_store.add(wait_request)
+    pending_before = await wait_store.get_pending(run_id)
+    assert len(pending_before) == 1
+    await wait_store.match_signal(run_id, signal_envelope)
+    pending_after = await wait_store.get_pending(run_id)
+    assert len(pending_after) == 0  # wait was claimed (active -> resumed)
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_mark_resumed_removes_from_pending(
+    wait_store: WaitStoreIfce,
+    wait_request: WaitRequest,
+    run_id: str,
+) -> None:
+    """Exactly-once resume: mark_resumed→resumed; not returned by get_pending."""
+    await wait_store.add(wait_request)
+    await wait_store.mark_resumed(run_id, wait_request.wait_id)
+    pending = await wait_store.get_pending(run_id)
+    assert len(pending) == 0
+
+
+def test_signal_idempotency_envelope_requires_signal_id() -> None:
+    """Signals require idempotency: every signal has stable signal_id (required field)."""
+    env = SignalEnvelope(
+        signal_type="x",
+        payload=(),
+        signal_id="unique_id_123",
+        correlation_id=None,
+        causation_id=None,
+        received_at=datetime.now(UTC),
+    )
+    assert env.signal_id == "unique_id_123"
+
+
+@pytest.mark.asyncio
+async def test_signal_idempotency_duplicate_signal_id_does_not_double_resume() -> None:
+    """Duplicate delivery of same signal_id must not cause second resume (store deduplicates)."""
+    store = InMemoryWaitStore()
+    run_id = "run_1"
+    req = WaitRequest(
+        wait_id="w1",
+        run_id=run_id,
+        node_id="n",
+        attempt=1,
+        signal_type="same",
+        match=None,
+        timeout_at=None,
+    )
+    await store.add(req)
+    env = SignalEnvelope(
+        signal_type="same",
+        payload=(),
+        signal_id="same_signal_id",
+        correlation_id=None,
+        causation_id=None,
+        received_at=datetime.now(UTC),
+    )
+    first = await store.match_signal(run_id, env)
+    assert first == "w1"
+    second = await store.match_signal(run_id, env)  # same signal_id again
+    assert second is None  # idempotency: no second resume
 
 
 # === WaitStore tests (run isolation, exactly-once, deterministic) ===
@@ -189,7 +361,8 @@ async def test_wait_store_run_isolation(
 
     envelope = SignalEnvelope(
         signal_type="approval",
-        payload={},
+        payload=(),
+        signal_id="sig_approval_1",
         correlation_id=None,
         causation_id=None,
         received_at=datetime.now(UTC),
@@ -220,21 +393,48 @@ async def test_wait_store_match_signal_deterministic_fifo(
         )
         await wait_store.add(req)
 
-    envelope = SignalEnvelope(
+    # Three distinct signal deliveries (different signal_ids) to consume three waits
+    envelope1 = SignalEnvelope(
         signal_type="same",
-        payload={},
+        payload=(),
+        signal_id="sig_same_1",
         correlation_id=None,
         causation_id=None,
         received_at=datetime.now(UTC),
     )
-    matched = await wait_store.match_signal(run_id, envelope)
+    envelope2 = SignalEnvelope(
+        signal_type="same",
+        payload=(),
+        signal_id="sig_same_2",
+        correlation_id=None,
+        causation_id=None,
+        received_at=datetime.now(UTC),
+    )
+    envelope3 = SignalEnvelope(
+        signal_type="same",
+        payload=(),
+        signal_id="sig_same_3",
+        correlation_id=None,
+        causation_id=None,
+        received_at=datetime.now(UTC),
+    )
+    matched = await wait_store.match_signal(run_id, envelope1)
     assert matched == "w_0"
-    # Second match returns next
-    matched2 = await wait_store.match_signal(run_id, envelope)
+    matched2 = await wait_store.match_signal(run_id, envelope2)
     assert matched2 == "w_1"
-    matched3 = await wait_store.match_signal(run_id, envelope)
+    matched3 = await wait_store.match_signal(run_id, envelope3)
     assert matched3 == "w_2"
-    matched_none = await wait_store.match_signal(run_id, envelope)
+    matched_none = await wait_store.match_signal(
+        run_id,
+        SignalEnvelope(
+            signal_type="same",
+            payload=(),
+            signal_id="sig_same_4",
+            correlation_id=None,
+            causation_id=None,
+            received_at=datetime.now(UTC),
+        ),
+    )
     assert matched_none is None
 
 
@@ -250,7 +450,7 @@ async def test_wait_store_match_signal_type_and_match_filter(
         node_id="n",
         attempt=1,
         signal_type="email.reply",
-        match={"thread_id": "t1"},
+        match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=None,
     )
     req2 = WaitRequest(
@@ -268,7 +468,8 @@ async def test_wait_store_match_signal_type_and_match_filter(
     # Signal approval: only w2 matches; w1 remains pending
     envelope_approval = SignalEnvelope(
         signal_type="approval",
-        payload={"thread_id": "t1"},
+        payload=selectors_from_dict({"thread_id": "t1"}) or (),
+        signal_id="sig_approval_2",
         correlation_id=None,
         causation_id=None,
         received_at=datetime.now(UTC),
@@ -281,7 +482,8 @@ async def test_wait_store_match_signal_type_and_match_filter(
     # Signal email.reply with matching payload: w1 matches
     envelope_reply = SignalEnvelope(
         signal_type="email.reply",
-        payload={"thread_id": "t1"},
+        payload=selectors_from_dict({"thread_id": "t1"}) or (),
+        signal_id="sig_reply_1",
         correlation_id=None,
         causation_id=None,
         received_at=datetime.now(UTC),
@@ -303,13 +505,14 @@ async def test_wait_store_match_signal_rejects_payload_missing_match_key(
         node_id="n",
         attempt=1,
         signal_type="email.reply",
-        match={"thread_id": "t1"},
+        match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=None,
     )
     await wait_store.add(req)
     envelope = SignalEnvelope(
         signal_type="email.reply",
-        payload={},  # missing thread_id
+        payload=(),  # missing thread_id
+        signal_id="sig_missing_1",
         correlation_id=None,
         causation_id=None,
         received_at=datetime.now(UTC),
@@ -331,13 +534,14 @@ async def test_wait_store_match_signal_rejects_payload_wrong_value(
         node_id="n",
         attempt=1,
         signal_type="email.reply",
-        match={"thread_id": "t1"},
+        match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=None,
     )
     await wait_store.add(req)
     envelope = SignalEnvelope(
         signal_type="email.reply",
-        payload={"thread_id": "t2"},
+        payload=selectors_from_dict({"thread_id": "t2"}) or (),
+        signal_id="sig_wrong_1",
         correlation_id=None,
         causation_id=None,
         received_at=datetime.now(UTC),
@@ -352,20 +556,21 @@ async def test_wait_store_match_signal_empty_match_matches_any_payload(
     wait_store: WaitStoreIfce,
     run_id: str,
 ) -> None:
-    """match={} means no filter: any payload with same signal_type matches (optional filter)."""
+    """match=() means no filter: any payload with same signal_type matches (optional filter)."""
     req = WaitRequest(
         wait_id="w1",
         run_id=run_id,
         node_id="n",
         attempt=1,
         signal_type="approval",
-        match={},
+        match=(),
         timeout_at=None,
     )
     await wait_store.add(req)
     envelope = SignalEnvelope(
         signal_type="approval",
-        payload={"any": "keys"},
+        payload=selectors_from_dict({"any": "keys"}) or (),
+        signal_id="sig_any_1",
         correlation_id=None,
         causation_id=None,
         received_at=datetime.now(UTC),
@@ -386,6 +591,24 @@ async def test_wait_store_exactly_once_resume(
     await wait_store.add(wait_request)
     first = await wait_store.match_signal(run_id, signal_envelope)
     assert first == wait_request.wait_id
+    second = await wait_store.match_signal(run_id, signal_envelope)
+    assert second is None
+    pending = await wait_store.get_pending(run_id)
+    assert len(pending) == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_store_signal_idempotency_duplicate_signal_id_returns_none(
+    wait_store: WaitStoreIfce,
+    wait_request: WaitRequest,
+    run_id: str,
+    signal_envelope: SignalEnvelope,
+) -> None:
+    """Duplicate delivery of same signal_id does not cause second resume (idempotency)."""
+    await wait_store.add(wait_request)
+    first = await wait_store.match_signal(run_id, signal_envelope)
+    assert first == wait_request.wait_id
+    # Same signal_id again: must not match any wait (already applied)
     second = await wait_store.match_signal(run_id, signal_envelope)
     assert second is None
     pending = await wait_store.get_pending(run_id)
@@ -553,7 +776,7 @@ async def test_runtime_workflow_reply_or_timeout_branch_deterministically(
         node_id="node_a",
         attempt=1,
         signal_type="email.reply",
-        match={"thread_id": "t1"},
+        match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=past,
     )
     await wait_store.add(wait_timeout)

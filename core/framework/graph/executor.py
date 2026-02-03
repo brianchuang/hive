@@ -44,8 +44,9 @@ class ExecutionResult:
     total_tokens: int = 0
     total_latency_ms: int = 0
     path: list[str] = field(default_factory=list)  # Node IDs traversed
-    paused_at: str | None = None  # Node ID where execution paused for HITL
+    paused_at: str | None = None  # Node ID where execution paused (HITL or durable wait)
     session_state: dict[str, Any] = field(default_factory=dict)  # State to resume from
+    paused: Any = None  # ExecutionPaused when suspended on durable wait
 
     # Execution quality metrics
     total_retries: int = 0  # Total number of retries across all nodes
@@ -188,6 +189,7 @@ class GraphExecutor:
         goal: Goal,
         input_data: dict[str, Any] | None = None,
         session_state: dict[str, Any] | None = None,
+        durable_wait_runtime: Any = None,
     ) -> ExecutionResult:
         """
         Execute a graph for a goal.
@@ -197,6 +199,7 @@ class GraphExecutor:
             goal: The goal driving execution
             input_data: Initial input data
             session_state: Optional session state to resume from (with paused_at, memory, etc.)
+            durable_wait_runtime: Optional durable wait/signal runtime for nodes that suspend
 
         Returns:
             ExecutionResult with output and metrics
@@ -259,7 +262,7 @@ class GraphExecutor:
             self.logger.info(f"🔄 Resuming from: {current_node_id}")
 
         # Start run
-        _run_id = self.runtime.start_run(
+        run_id = self.runtime.start_run(
             goal_id=goal.id,
             goal_description=goal.description,
             input_data=input_data or {},
@@ -297,6 +300,8 @@ class GraphExecutor:
                     goal=goal,
                     input_data=input_data or {},
                     max_tokens=graph.max_tokens,
+                    run_id=run_id,
+                    durable_wait_runtime=durable_wait_runtime,
                 )
 
                 # Log actual input data being read
@@ -347,6 +352,31 @@ class GraphExecutor:
                             )
 
                 if result.success:
+                    # Durable wait: node suspended on wait; return paused result
+                    if getattr(result, "paused", None) is not None:
+                        paused_obj = result.paused
+                        session_state_out = getattr(paused_obj, "session_state", {}) or {}
+                        if "memory" not in session_state_out and memory:
+                            session_state_out = {**session_state_out, "memory": memory.read_all()}
+                        total_retries_count = sum(node_retry_counts.values())
+                        nodes_failed = [nid for nid, c in node_retry_counts.items() if c > 0]
+                        return ExecutionResult(
+                            success=True,
+                            output=result.output,
+                            steps_executed=steps,
+                            total_tokens=total_tokens,
+                            total_latency_ms=total_latency,
+                            path=path,
+                            paused_at=getattr(paused_obj, "node_id", node_spec.id),
+                            session_state=session_state_out,
+                            paused=paused_obj,
+                            total_retries=total_retries_count,
+                            nodes_with_failures=nodes_failed,
+                            retry_details=dict(node_retry_counts),
+                            had_partial_failures=len(nodes_failed) > 0,
+                            execution_quality="degraded" if total_retries_count > 0 else "clean",
+                        )
+
                     self.logger.info(
                         f"   ✓ Success (tokens: {result.tokens_used}, "
                         f"latency: {result.latency_ms}ms)"
@@ -631,6 +661,8 @@ class GraphExecutor:
         goal: Goal,
         input_data: dict[str, Any],
         max_tokens: int = 4096,
+        run_id: str | None = None,
+        durable_wait_runtime: Any = None,
     ) -> NodeContext:
         """Build execution context for a node."""
         # Filter tools to those available to this node
@@ -655,6 +687,8 @@ class GraphExecutor:
             goal_context=goal.to_prompt_context(),
             goal=goal,  # Pass Goal object for LLM-powered routers
             max_tokens=max_tokens,
+            run_id=run_id,
+            durable_wait_runtime=durable_wait_runtime,
         )
 
     # Valid node types - no ambiguous "llm" type allowed
