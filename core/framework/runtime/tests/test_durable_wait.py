@@ -36,6 +36,9 @@ from framework.runtime.durable_wait import (
 )
 from framework.runtime.event_bus import AgentEvent, EventBus, EventType
 
+# Deterministic created_at for WaitRequest (replay-equivalence contract).
+CREATED_AT = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
+
 # === Fixtures ===
 
 
@@ -54,6 +57,7 @@ def wait_request(run_id: str) -> WaitRequest:
         signal_type="email.reply",
         match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=datetime(2025, 3, 1, 12, 0, 0, tzinfo=UTC),
+        created_at=CREATED_AT,
     )
 
 
@@ -95,6 +99,7 @@ def test_wait_request_creation(wait_request: WaitRequest, run_id: str) -> None:
     assert wait_request.signal_type == "email.reply"
     assert wait_request.match == (("thread_id", "t1"),)
     assert wait_request.timeout_at is not None
+    assert wait_request.created_at == CREATED_AT
     assert wait_request.schema_version == 1
     assert wait_request.type == "wait_request"
 
@@ -178,6 +183,7 @@ def test_versioning_wait_request_has_schema_version_and_type() -> None:
         signal_type="x",
         match=None,
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     assert req.schema_version == 1
     assert req.type == "wait_request"
@@ -209,6 +215,7 @@ async def test_deterministic_matching_exact_key_value_only() -> None:
         signal_type="email.reply",
         match=match,
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     store = InMemoryWaitStore()
     run_id = "run_1"
@@ -280,6 +287,7 @@ async def test_signal_idempotency_duplicate_signal_id_does_not_double_resume() -
         signal_type="same",
         match=None,
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     await store.add(req)
     env = SignalEnvelope(
@@ -356,6 +364,7 @@ async def test_wait_store_run_isolation(
         signal_type="approval",
         match=None,
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req_a)
 
@@ -390,6 +399,7 @@ async def test_wait_store_match_signal_deterministic_fifo(
             signal_type="same",
             match=None,
             timeout_at=None,
+            created_at=CREATED_AT,
         )
         await wait_store.add(req)
 
@@ -452,6 +462,7 @@ async def test_wait_store_match_signal_type_and_match_filter(
         signal_type="email.reply",
         match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     req2 = WaitRequest(
         wait_id="w2",
@@ -461,6 +472,7 @@ async def test_wait_store_match_signal_type_and_match_filter(
         signal_type="approval",
         match=None,
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req1)
     await wait_store.add(req2)
@@ -507,6 +519,7 @@ async def test_wait_store_match_signal_rejects_payload_missing_match_key(
         signal_type="email.reply",
         match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
     envelope = SignalEnvelope(
@@ -536,6 +549,7 @@ async def test_wait_store_match_signal_rejects_payload_wrong_value(
         signal_type="email.reply",
         match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
     envelope = SignalEnvelope(
@@ -565,6 +579,7 @@ async def test_wait_store_match_signal_empty_match_matches_any_payload(
         signal_type="approval",
         match=(),
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
     envelope = SignalEnvelope(
@@ -630,6 +645,7 @@ async def test_wait_store_get_expired(
         signal_type="x",
         match=None,
         timeout_at=past,
+        created_at=CREATED_AT,
     )
     req_future = WaitRequest(
         wait_id="not_expired",
@@ -639,6 +655,7 @@ async def test_wait_store_get_expired(
         signal_type="x",
         match=None,
         timeout_at=future,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req_past)
     await wait_store.add(req_future)
@@ -666,6 +683,7 @@ async def test_wait_store_get_expired_none_timeout(
         signal_type="x",
         match=None,
         timeout_at=None,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
     expired = await wait_store.get_expired(datetime.now(UTC))
@@ -778,6 +796,7 @@ async def test_runtime_workflow_reply_or_timeout_branch_deterministically(
         signal_type="email.reply",
         match=selectors_from_dict({"thread_id": "t1"}),
         timeout_at=past,
+        created_at=CREATED_AT,
     )
     await wait_store.add(wait_timeout)
     now = datetime(2025, 2, 1, 12, 0, 0, tzinfo=UTC)
@@ -893,6 +912,7 @@ async def test_runtime_tick_returns_expired_waits_as_wait_resumed(
         signal_type="x",
         match=None,
         timeout_at=past,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
     now = datetime(2025, 2, 1, 12, 0, 0, tzinfo=UTC)
@@ -921,6 +941,7 @@ async def test_runtime_tick_emits_wait_timed_out(
         signal_type="x",
         match=None,
         timeout_at=past,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
 
@@ -960,6 +981,7 @@ async def test_runtime_tick_emits_wait_resumed(
         signal_type="x",
         match=None,
         timeout_at=past,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
 
@@ -999,6 +1021,7 @@ async def test_runtime_tick_exactly_once_per_wait(
         signal_type="x",
         match=None,
         timeout_at=past,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
     now = datetime(2025, 2, 1, 12, 0, 0, tzinfo=UTC)
@@ -1026,6 +1049,7 @@ async def test_runtime_signal_then_tick_exactly_once_no_double_resume(
         signal_type=wait_request.signal_type,
         match=wait_request.match,
         timeout_at=past,
+        created_at=wait_request.created_at,
     )
     await durable_runtime.wait(req, session_state={})
     now = datetime(2025, 2, 1, 12, 0, 0, tzinfo=UTC)
@@ -1054,6 +1078,7 @@ async def test_runtime_concurrent_signal_and_tick_exactly_one_resume(
         signal_type=wait_request.signal_type,
         match=wait_request.match,
         timeout_at=past,
+        created_at=wait_request.created_at,
     )
     await durable_runtime.wait(req, session_state={})
     now = datetime(2025, 2, 1, 12, 0, 0, tzinfo=UTC)
@@ -1090,6 +1115,7 @@ async def test_runtime_tick_multi_run_returns_correct_run_wait_ids(
             signal_type="x",
             match=None,
             timeout_at=past,
+            created_at=CREATED_AT,
         )
         await wait_store.add(req)
 
@@ -1126,6 +1152,7 @@ async def test_runtime_tick_with_none_uses_current_time(
         signal_type="x",
         match=None,
         timeout_at=future_dt,
+        created_at=CREATED_AT,
     )
     await wait_store.add(req)
     resumed = await durable_runtime.tick(now=None)

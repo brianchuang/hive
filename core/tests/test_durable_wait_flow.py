@@ -87,6 +87,7 @@ class SendEmailThenWaitNode(NodeProtocol):
             signal_type="email.reply",
             match=selectors_from_dict({"thread_id": thread_id}),
             timeout_at=timeout_at,
+            created_at=datetime.now(UTC),
         )
         session_state = {
             "paused_at": ctx.node_id,

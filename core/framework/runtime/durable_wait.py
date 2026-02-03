@@ -86,7 +86,9 @@ class WaitRequest:
     signal is delivered or timeout_at is reached.
 
     Durable invariants: schema_version for upgrade-on-read; match is
-    immutable and deterministic (exact-match selectors only).
+    immutable and deterministic (exact-match selectors only). created_at is
+    part of the contract: set at creation time for replay equivalence across
+    backends; stores must not invent it at insert time.
     """
 
     wait_id: str
@@ -96,6 +98,7 @@ class WaitRequest:
     signal_type: str  # e.g. "email.reply", "approval"
     match: ImmutableSelectors | None  # optional exact-match selectors
     timeout_at: datetime | None
+    created_at: datetime  # set at creation for replay equivalence
     schema_version: int = 1
     type: str = "wait_request"
 
